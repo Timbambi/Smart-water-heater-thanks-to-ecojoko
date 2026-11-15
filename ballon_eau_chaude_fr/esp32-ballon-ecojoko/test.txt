@@ -1,0 +1,5 @@
+lancer dans le dossier
+
+
+$env:PAGE="data/index.html"
+node --test tests/index.test.mjs
