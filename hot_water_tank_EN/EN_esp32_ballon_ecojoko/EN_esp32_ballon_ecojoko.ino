@@ -1,4 +1,4 @@
-
+// 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -19,7 +19,7 @@
 
 // Program version: increment by hand on every change (format YYYY.MM.DD-n, comparable as text).
 // FW_BUILD changes by itself on every compilation: if the time shown in System has not moved, the flash did not go through.
-static const char FW_VERSION[] = "2026.11.15-2";
+static const char FW_VERSION[] = "2026.11.18-1";
 static const char FW_BUILD[]   = __DATE__ " " __TIME__;
 constexpr uint32_t CONTROL_PERIOD_MS = 5000; // Control loop frequency (5 s)
 constexpr uint32_t MIN_OFF_TO_ON_MS = 60000; // Minimum 1 min between an OFF and the next ON
@@ -74,6 +74,13 @@ constexpr uint8_t  ANT_WX_MAX          = 72;   // hours of weather kept in RAM (
 constexpr uint8_t  ANT_REC_MAX         = 35;   // cycles (days) kept in /ant.json
 constexpr uint16_t ANT_HR_N            = 192;  // forecast/actual hours kept (8 days, ring buffer) in /ant_hr.json
 constexpr uint32_t ANT_HR_MIN_SEC      = 1800; // an hour is only kept if >= 30 min were measured
+// Shading by hour of the day (section "Shading"): learned from the hourly forecast / actual, applied only if cfg.antShade.
+constexpr uint8_t  ANT_SHADE_N         = 20;   // samples kept per hour of the day (sliding window of about 20 usable days)
+constexpr uint8_t  ANT_SHADE_MIN_N     = 7;    // minimum samples for an hour to get a factor
+constexpr uint8_t  ANT_SHADE_MIN_H     = 4;    // minimum number of hours with a factor (the reference level is computed on them)
+constexpr float    ANT_SHADE_MIN_P     = 0.35f; // a sample is kept only if the forecast is >= 35 % of heaterW (otherwise too noisy)
+constexpr float    ANT_SHADE_F_MIN     = 0.30f; // clamp of the factor
+constexpr float    ANT_SHADE_F_MAX     = 1.20f;
 constexpr uint32_t ANT_WX_REFRESH_MS   = 3UL * 3600UL * 1000UL; // new forecast every 3 h
 constexpr uint32_t ANT_WX_RETRY_MS     = 15UL * 60UL * 1000UL;  // after a failure
 constexpr uint32_t ANT_WX_TIMEOUT_MS   = 8000;
@@ -265,6 +272,7 @@ struct Config {
   uint16_t snoozeMin        = 480;   // duration of the remote silence (red banner button), in minutes
   // Forecast (full mode): see section 6a
   String   antMode          = "shadow"; // off = classic full | shadow = computes without acting | on = drives the HC
+  bool     antShade         = false;    // apply the learned shading factor to the decision (false = learned and displayed only)
   uint16_t tankLiters       = 200;      // tank volume (used to estimate the capacity if tankKWh = 0)
   float    tankKWh          = 0.0f;     // useful capacity in kWh (energy "cold -> full"); 0 = estimated: litres x 52.3 Wh
   uint8_t  reservePct       = 40;       // hot water reserve to keep before the first useful sun (% of capacity)
@@ -408,6 +416,12 @@ static AntHr   antHr[ANT_HR_N];            // hourly forecast / actual ring (see
 static uint32_t antHrCur = 0;              // epoch hour currently being accumulated (0 = none)
 static float    antHrWh = 0.0f;            // usable surplus accumulated over the current hour (Wh)
 static uint32_t antHrSec = 0;              // seconds measured over the current hour
+// Shading: ratio actual / forecast x100 per hour of the day (UTC hour: the sun's position does not follow the DST change).
+static uint8_t  antShadeS[24][ANT_SHADE_N]; // ring of samples per hour (only the first antShadeCnt[h] are valid)
+static uint8_t  antShadeHead[24], antShadeCnt[24];
+static float    antShadeF[24];             // learned factor (1.0 = neutral), valid only if antShadeOk[h]
+static bool     antShadeOk[24];
+static float    antShadeRef = NAN;         // reference level: median of the hourly medians
 
 // Heating log: see heatLogTick(). lastTickWh/PaidWh are filled in by accumulateEnergyCost().
 // sec/wh/paidWh are uint32 (not uint16): a segment longer than 18 h (65535 s) or above 65535 Wh
@@ -799,6 +813,7 @@ bool readConfig() {
   cfg.muteEnd          = (uint16_t)(d["muteEnd"] | (int)cfg.muteEnd);
   cfg.snoozeMin        = (uint16_t)(d["snoozeMin"] | (int)cfg.snoozeMin);
   cfg.antMode          = d["antMode"] | cfg.antMode;
+  cfg.antShade         = d["antShade"] | cfg.antShade;
   cfg.tankLiters       = (uint16_t)(d["tankLiters"] | (int)cfg.tankLiters);
   cfg.tankKWh          = (float)(d["tankKWh"] | cfg.tankKWh);
   cfg.reservePct       = (uint8_t)(d["reservePct"] | (int)cfg.reservePct);
@@ -860,6 +875,7 @@ void saveConfig() {
   d["muteEnd"]          = cfg.muteEnd;
   d["snoozeMin"]        = cfg.snoozeMin;
   d["antMode"]          = cfg.antMode;
+  d["antShade"]         = cfg.antShade;
   d["tankLiters"]       = cfg.tankLiters;
   d["tankKWh"]          = cfg.tankKWh;
   d["reservePct"]       = cfg.reservePct;
@@ -2134,8 +2150,14 @@ static float antThresholdW() {
   r = fminf(0.95f, fmaxf(0.05f, r));
   return cfg.heaterW * r;
 }
+// Shading factor applied to the DECISION for the slot starting at epoch e: 1.0 unless enabled AND learned for that hour.
+static float antShadeApply(uint32_t e) {
+  if (!cfg.antShade) return 1.0f;
+  uint8_t h = (uint8_t)((e / 3600UL) % 24UL);
+  return antShadeOk[h] ? antShadeF[h] : 1.0f;
+}
 static bool antHourUseful(int i) {
-  return ant.kValid && (ant.k * (float)ant.wxRad[i]) >= antThresholdW();
+  return ant.kValid && (ant.k * antShadeApply(ant.wxStart + (uint32_t)i * 3600UL) * (float)ant.wxRad[i]) >= antThresholdW();
 }
 // Seconds of useful sun in [a, b[.
 static uint32_t antUsefulSec(uint32_t a, uint32_t b) {
@@ -2286,6 +2308,78 @@ static float antNeedDayAt(uint32_t ne) {
   return need;
 }
 
+/* ---------- Shading by hour of the day (learned from the hourly forecast / actual) ----------
+   A tree shadow comes back at the same sun position, a cloud does not. For each hour of the day, ratio = actual / forecast
+   over the last ANT_SHADE_N usable days: the median wipes out the clouds. Factor = hourly median / reference (median of
+   the hourly medians), so the overall level (already carried by k) is not counted twice; clamped to [0.3, 1.2].
+   Samples are taken against the RAW forecast (antHr.p), never the shaded one: otherwise enabling the factor would feed
+   its own learning. Learned and displayed all the time; only used by the decision if cfg.antShade. /ant_shade.json. */
+static void antShadeRecompute() {
+  float med[24], tmp[ANT_SHADE_N], lvl[24];
+  uint8_t nv = 0;
+  for (uint8_t h = 0; h < 24; ++h) {
+    antShadeOk[h] = false;
+    if (antShadeCnt[h] < ANT_SHADE_MIN_N) continue;
+    for (uint8_t j = 0; j < antShadeCnt[h]; ++j) tmp[j] = (float)antShadeS[h][j];
+    med[h] = antMedian(tmp, antShadeCnt[h]) / 100.0f;
+    antShadeOk[h] = true; // provisional: confirmed below
+    lvl[nv++] = med[h];
+  }
+  antShadeRef = NAN;
+  float ref = nv >= ANT_SHADE_MIN_H ? antMedian(lvl, nv) : 0.0f;
+  if (!(ref > 0.05f)) { for (uint8_t h = 0; h < 24; ++h) antShadeOk[h] = false; return; }
+  antShadeRef = ref;
+  for (uint8_t h = 0; h < 24; ++h)
+    if (antShadeOk[h]) antShadeF[h] = fminf(ANT_SHADE_F_MAX, fmaxf(ANT_SHADE_F_MIN, med[h] / ref));
+}
+
+// Called when an hour is closed: r = actual (W), p = raw forecast frozen at the start of the cycle (W).
+static void antShadeAdd(uint32_t hh, uint16_t r, uint16_t p) {
+  if (r == 0xFFFF || p == 0xFFFF || !((float)p >= ANT_SHADE_MIN_P * cfg.heaterW)) return;
+  uint8_t h = (uint8_t)(hh % 24UL);
+  float q = 100.0f * (float)r / (float)p;
+  antShadeS[h][antShadeHead[h]] = (uint8_t)(q > 250.0f ? 250 : (int)(q + 0.5f));
+  antShadeHead[h] = (uint8_t)((antShadeHead[h] + 1) % ANT_SHADE_N);
+  if (antShadeCnt[h] < ANT_SHADE_N) antShadeCnt[h]++;
+  antShadeRecompute();
+}
+
+// File: {"s":[[ratios of UTC hour 0, oldest first],[hour 1],...]}. Written with the hourly ring (cycle change, manual checkpoint).
+static void antShadeSave() {
+  JsonDocument d;
+  JsonArray a = d["s"].to<JsonArray>();
+  for (uint8_t h = 0; h < 24; ++h) {
+    JsonArray x = a.add<JsonArray>();
+    for (uint8_t k = 0; k < antShadeCnt[h]; ++k)
+      x.add(antShadeS[h][antShadeCnt[h] < ANT_SHADE_N ? k : (antShadeHead[h] + k) % ANT_SHADE_N]);
+  }
+  if (!writeJsonAtomic("/ant_shade.json", d)) reportError("Failed to write /ant_shade.json", ERROR_STORAGE);
+}
+
+static void antShadeLoad() {
+  File in = LittleFS.open("/ant_shade.json", "r");
+  if (!in) return;
+  JsonDocument d;
+  DeserializationError err = deserializeJson(d, in);
+  in.close();
+  if (err || !d["s"].is<JsonArray>()) return;
+  uint8_t h = 0;
+  for (JsonVariantConst xv : d["s"].as<JsonArrayConst>()) {
+    if (h >= 24) break;
+    uint8_t n = 0;
+    if (xv.is<JsonArrayConst>()) {
+      for (JsonVariantConst v : xv.as<JsonArrayConst>()) {
+        int q = v | -1;
+        if (q < 0 || q > 250 || n >= ANT_SHADE_N) continue;
+        antShadeS[h][n++] = (uint8_t)q;
+      }
+    }
+    antShadeCnt[h] = n; antShadeHead[h] = (uint8_t)(n % ANT_SHADE_N);
+    h++;
+  }
+  antShadeRecompute();
+}
+
 /* ---------- Forecast / actual solar PER HOUR (display only: no effect on the decision) ----------
    Ring of ANT_HR_N slots. Actual: average usable surplus (min(heaterW, -restHouse)), same definition as "pot".
    Forecast: min(heaterW, k x radiation) computed in antCapturePrediction (forecast frozen at the start of the cycle).
@@ -2300,7 +2394,11 @@ static uint16_t antHrW(float w) { return w <= 0.0f ? 0 : (w >= 65000.0f ? 65000 
 
 // Closes the current hour: writes the average actual value if the hour was measured enough.
 static void antHrClose() {
-  if (antHrCur != 0 && antHrSec >= ANT_HR_MIN_SEC) antHr[antHrIdx(antHrCur)].r = antHrW(antHrWh * 3600.0f / (float)antHrSec);
+  if (antHrCur != 0 && antHrSec >= ANT_HR_MIN_SEC) {
+    AntHr &x = antHr[antHrIdx(antHrCur)];
+    x.r = antHrW(antHrWh * 3600.0f / (float)antHrSec);
+    antShadeAdd(antHrCur, x.r, x.p); // shading statistic (against the raw forecast)
+  }
   antHrWh = 0.0f; antHrSec = 0;
 }
 
@@ -2382,8 +2480,8 @@ static void antCapturePrediction(uint32_t ne) {
         float rd = antRadAt(h0 + (uint32_t)i * 3600UL);
         if (!isnan(rd)) {
           float w = fminf(cfg.heaterW, ant.k * rd);
-          sol += w;
-          antHr[antHrIdx(h0 / 3600UL + i)].p = antHrW(w); // hourly forecast, frozen like the cycle forecast
+          sol += fminf(cfg.heaterW, ant.k * antShadeApply(h0 + (uint32_t)i * 3600UL) * rd); // with shading if enabled
+          antHr[antHrIdx(h0 / 3600UL + i)].p = antHrW(w); // hourly forecast, frozen like the cycle forecast (RAW: base of the shading statistic)
         }
       }
       ant.cycPredSolWh = sol;
@@ -2459,6 +2557,7 @@ static void antCycleClose(uint32_t closingCycle) {
   ant.cycPredWh = -1.0f; ant.cycPredSolWh = -1.0f;
   antSave();
   antHrSave(); // forecast / actual per hour (8-day ring)
+  antShadeSave(); // shading statistic (per hour of the day)
   antRefresh();
 }
 
@@ -2480,6 +2579,7 @@ static bool antCycSave() {
   if (ant.refValid && !ant.refBad) { d["re"] = ant.refEpoch; d["wh"] = ant.whSince; }
   bool ok = writeJsonAtomic("/ant_cyc.json", d);
   antHrSave(); // the hourly ring follows the same rhythm (manual button / controlled restart)
+  antShadeSave();
   return ok;
 }
 
@@ -2756,7 +2856,10 @@ static bool antFetchWeather() {
     strncpy(ant.wxErr, "not hourly?", sizeof(ant.wxErr) - 1);
     return false;
   }
-  ant.wxStart = first;
+  /* Open-Meteo: shortwave_radiation stamped T = mean of [T-1h, T] (the PRECEDING hour). The slots used by
+     antIdx() are [wxStart+i*3600, +3600[ : shift the start by 1 h so slot i covers the averaged period.
+     (Temperature is instantaneous and shifts by 1 h too: negligible.) */
+  ant.wxStart = first - 3600UL;
   ant.wxN = (uint8_t)n;
   for (size_t i = 0; i < n; ++i) {
     ant.wxT10[i] = tp[i].isNull() ? INT16_MIN : (int16_t)lroundf(tp[i].as<float>() * 10.0f);
@@ -2790,6 +2893,7 @@ static void antService(uint32_t now) {
 static void antFillStatus(JsonDocument &d) {
   uint32_t ne = (uint32_t)time(nullptr);
   d["antMode"]       = cfg.antMode;
+  d["antShade"]      = cfg.antShade;
   d["antValid"]      = ant.valid;
   d["antHeat"]       = ant.heat;
   d["antForce"]      = ant.force;
@@ -2840,6 +2944,14 @@ void apiAnt() {
   d["reservePct"]    = cfg.reservePct;
   d["lat"]           = cfg.lat;
   d["lon"]           = cfg.lon;
+  {
+    // Shading by UTC hour of the day: factor (-1 = not enough samples yet) and number of samples.
+    JsonObject sj = d["shade"].to<JsonObject>();
+    sj["minN"] = ANT_SHADE_MIN_N;
+    if (!isnan(antShadeRef)) sj["ref"] = antShadeRef;
+    JsonArray sf = sj["f"].to<JsonArray>(), sn = sj["n"].to<JsonArray>();
+    for (uint8_t h = 0; h < 24; ++h) { sf.add(antShadeOk[h] ? antShadeF[h] : -1.0f); sn.add(antShadeCnt[h]); }
+  }
   JsonArray w = d["wx"].to<JsonArray>();
   for (uint32_t e = ne - ne % 3600UL; e < ne + 30UL * 3600UL; e += 3600UL) {
     int i = antIdx(e);
@@ -3312,7 +3424,7 @@ void apiConfig() {
     d["wdTxPin"] = cfg.wdTxPin; d["muteOn"] = cfg.muteOn; d["muteStart"] = cfg.muteStart; d["muteEnd"] = cfg.muteEnd; d["snoozeMin"] = cfg.snoozeMin;
     d["manualEpoch"] = cfg.manualEpoch;
     d["autoTime"] = cfg.autoTime;
-    d["antMode"] = cfg.antMode; d["tankLiters"] = cfg.tankLiters; d["tankKWh"] = cfg.tankKWh; d["reservePct"] = cfg.reservePct;
+    d["antMode"] = cfg.antMode; d["antShade"] = cfg.antShade; d["tankLiters"] = cfg.tankLiters; d["tankKWh"] = cfg.tankKWh; d["reservePct"] = cfg.reservePct;
     d["deadlineMin"] = cfg.deadlineMin; d["lat"] = cfg.lat; d["lon"] = cfg.lon;
     d["pvKwc"] = cfg.pvKwc; d["staticIp"] = cfg.staticIp; d["ip"] = cfg.ip; d["gw"] = cfg.gw; d["mask"] = cfg.mask; d["dns"] = cfg.dns; d["bootApSec"] = cfg.bootApSec;
     d["shellyTMaxC"] = cfg.shellyTMaxC; d["shellyTResumeC"] = cfg.shellyTResumeC; d["shellyHoldMin"] = cfg.shellyHoldMin; d["shellyTAlarmC"] = cfg.shellyTAlarmC;
@@ -3441,6 +3553,7 @@ void apiConfig() {
     if (d.containsKey("manualEpoch")) cfg.manualEpoch = d["manualEpoch"].as<uint32_t>();
     if (d.containsKey("autoTime")) cfg.autoTime = d["autoTime"].as<bool>();
     if (d.containsKey("antMode")) cfg.antMode = d["antMode"].as<String>();
+    if (d.containsKey("antShade")) cfg.antShade = d["antShade"].as<bool>();
     if (d.containsKey("tankLiters")) cfg.tankLiters = (uint16_t)d["tankLiters"].as<int>();
     if (d.containsKey("tankKWh")) cfg.tankKWh = d["tankKWh"].as<float>();
     if (d.containsKey("reservePct")) cfg.reservePct = (uint8_t)d["reservePct"].as<int>();
@@ -3863,7 +3976,7 @@ h1{font-size:1.25rem;margin:.2em 0}h2{font-size:1rem;margin:1.2em 0 .4em}
 .row{display:flex;justify-content:space-between;gap:8px;padding:2px 0}
 .big{font-size:1.15rem;font-weight:600}.ok{color:var(--ok)}.ko{color:var(--ko)}.w{color:var(--w)}
 label{display:block;margin:.5em 0 .1em;font-size:.9rem}input,select,button{font:inherit;padding:6px;width:100%;box-sizing:border-box}
-button{margin-top:10px;cursor:pointer}small{opacity:.7}
+button{margin-top:10px;cursor:pointer}small{opacity:.7}.chk{display:flex;align-items:center;gap:.5em}.chk input{width:auto;padding:0;margin:0}
 table{border-collapse:collapse;width:100%;font-size:.8rem}td,th{border-bottom:1px solid var(--b);padding:3px 4px;text-align:right}
 th:first-child,td:first-child{text-align:left}.bar{display:flex;gap:1px;align-items:flex-end;height:60px}
 .bar div{flex:1;background:#e0a800;min-width:2px}.bar div.n{background:#8886}
@@ -3871,6 +3984,7 @@ th:first-child,td:first-child{text-align:left}.bar{display:flex;gap:1px;align-it
 <h1>Tank forecast <small><a href="/">← home</a></small></h1>
 <div class="card" id="st">Loading…</div>
 <h2>Forecast sun (30 h)</h2><div class="card"><div class="bar" id="bar"></div><small>Yellow bars = hours when solar makes heating clearly cheaper than off-peak (HC) hours.</small></div>
+<h2>Shading by hour of the day</h2><div class="card"><div class="bar" id="shbar"></div><div id="shlab" style="display:flex;gap:1px;font-size:.65em;text-align:center"></div><p id="shtxt" style="margin:.6em 0 0"></p><small>Bar = factor learned for that hour (full height = ×1.2, grey = not enough samples yet). Ratio actual / forecast, median over the last days: a tree shadow comes back every day at the same hour, a cloud does not. Learned and displayed all the time; used by the decision only if the box below is ticked.</small></div>
 <h2>Learning</h2><div class="card" id="learn"></div>
 <h2>Settings</h2>
 <div class="card">
@@ -3883,6 +3997,7 @@ th:first-child,td:first-child{text-align:left}.bar{display:flex;gap:1px;align-it
 <label>Minimum hot water reserve (% of capacity)</label><input id="reservePct" type="number" min="0" max="90"><small>Level to keep before the sun takes over heating again.</small>
 <label>Check before the evening (time)</label><input id="deadline" type="time"><small>At that time the tank does not have to be full: it must keep the reserve plus enough to last the evening until the off-peak hours. Otherwise the system heats just the shortfall, at the last moment.</small>
 <label>Latitude / longitude (weather)</label><div class="row"><input id="lat" type="number" step="0.001"><input id="lon" type="number" step="0.001"></div>
+<label class="chk"><input id="antShade" type="checkbox"> Apply the shading factor to the decision</label><small>Leave unticked until the curve above looks consistent from one hour to the next (needs clear days: not before spring).</small>
 <button id="save">Save</button><small id="msg"></small></div>
 <h2>Latest days</h2><div class="card"><div style="overflow-x:auto"><table id="tb"></table></div><p id="sc" style="margin:.6em 0 0"></p><small>kWh, except Cov. (h), °C and Rad. (Wh/m²). Gap = forecast − actual (+: the model overestimates, on the comfort side). Forecast = taken at the start of the cycle (24 h need, usable solar surplus over 24 h); Actual sol. = measured usable surplus.</small></div>
 <script>
@@ -3922,14 +4037,21 @@ async function load(){
   <div class="row"><span>Solar coefficient k</span><span class="${a.antKValid?'ok':'w'}">${a.antKValid?a.k.toFixed(3)+' W per W/m²'+(a.kW<1?' (start '+a.kInit.toFixed(1)+', '+Math.round(a.kW*100)+' % learned)':''):'in progress ('+a.antKDays+' d, '+Math.round(a.kSumRad)+'/1500 Wh/m²)'}</span></div>
   <div class="row"><span>Temperature correction</span><span>${a.slopeValid?a.slopeWhPerC.toFixed(0)+' Wh/°C/day (ref. '+a.tRef.toFixed(1)+' °C)':'not calibrated yet'}</span></div>
   <div class="row"><span>Model / actual gap</span><span>×${a.errRatio.toFixed(2)}</span></div>`;
+ {const sh=a.shade||{f:[],n:[]},rows=[];
+  for(let u=0;u<24;u++){const d=new Date();d.setUTCHours(u,0,0,0);rows.push({lh:d.getHours(),f:(sh.f||[])[u],n:(sh.n||[])[u]||0})}
+  const day=rows.filter(x=>x.lh>=6&&x.lh<=21).sort((x,y)=>x.lh-y.lh);
+  $('shbar').innerHTML=day.map(x=>`<div class="${x.f>=0?'':'n'}" style="height:${x.f>=0?Math.max(3,Math.min(60,x.f*50)):(x.n?6:3)}px" title="${x.lh} h: ${x.f>=0?'×'+x.f.toFixed(2):'not enough samples'} (${x.n}/${sh.minN||7})"></div>`).join('');
+  $('shlab').innerHTML=day.map(x=>`<span style="flex:1">${x.lh}</span>`).join('');
+  const nv=day.filter(x=>x.f>=0).length;
+  $('shtxt').innerHTML=(nv?`${nv} hour(s) with a factor`+(sh.ref!==undefined?`, reference level ×${sh.ref.toFixed(2)}`:'')+'. ':'No factor yet: at least '+(sh.minN||7)+' usable days per hour are needed (forecast ≥ 35 % of the tank power). ')+`Applied to the decision: <b>${a.antShade?'yes':'no'}</b>.`;}
  $('bar').innerHTML=(a.wx||[]).map(h=>`<div class="${h.u?'':'n'}" style="height:${Math.max(3,Math.min(60,h.r/12))}px" title="${at(h.e)} ${h.r} W/m²"></div>`).join('');
  $('tb').innerHTML='<tr><th>Cycle</th><th>Need</th><th>Forecast</th><th>Gap</th><th>Cov. h</th><th>°C</th><th>Rad.</th><th>Sol. fcst</th><th>Sol. actual</th><th>HC avoidable</th></tr>'+(a.recs||[]).slice(-14).reverse().map(r=>{const ok=r.need>0,ec=ok&&r.pred!==undefined?r.pred-r.need:undefined;return `<tr><td>${r.c%1000}</td><td>${ok?r.need.toFixed(1):'—'}</td><td>${f1(r.pred)}</td><td>${ec===undefined?'—':(ec>0?'+':'')+ec.toFixed(1)}</td><td>${r.cov.toFixed(0)}</td><td>${f1(r.t)}</td><td>${Math.round(r.rad)}</td><td>${f1(r.psol)}</td><td>${(r.pot/1000).toFixed(1)}</td><td>${r.sk.toFixed(1)}</td></tr>`}).join('');
  $('sc').innerHTML=score(a.recs||[]);
- if(first){first=false;$('antMode').value=a.antMode;$('tankLiters').value=a.tankLiters;$('tankKWh').value=a.tankKWh;$('reservePct').value=a.reservePct;$('deadline').value=hm(a.deadlineMin);$('lat').value=a.lat;$('lon').value=a.lon}
+ if(first){first=false;$('antMode').value=a.antMode;$('antShade').checked=!!a.antShade;$('tankLiters').value=a.tankLiters;$('tankKWh').value=a.tankKWh;$('reservePct').value=a.reservePct;$('deadline').value=hm(a.deadlineMin);$('lat').value=a.lat;$('lon').value=a.lon}
 }
 $('save').onclick=async()=>{
  const [h,m]=$('deadline').value.split(':').map(Number);
- const body={antMode:$('antMode').value,tankLiters:+$('tankLiters').value,tankKWh:+$('tankKWh').value,reservePct:+$('reservePct').value,deadlineMin:h*60+m,lat:+$('lat').value,lon:+$('lon').value};
+ const body={antMode:$('antMode').value,antShade:$('antShade').checked,tankLiters:+$('tankLiters').value,tankKWh:+$('tankKWh').value,reservePct:+$('reservePct').value,deadlineMin:h*60+m,lat:+$('lat').value,lon:+$('lon').value};
  const r=await fetch('/api/config',{method:'POST',body:JSON.stringify(body)});
  $('msg').textContent=r.ok?' saved':' rejected: '+await r.text();load();
 };
@@ -4976,6 +5098,7 @@ void appSetup() {
   }
   antLoad(); // forecast history (daily need, solar, temperature)
   antHrLoad(); // forecast / actual per hour
+  antShadeLoad(); // shading statistic
   heatLoad(); // heating log
   wdInit(); // HB/ERR pins driven as early as possible (low level)
   sosBoot(); // alarm left "in progress" in the SOS log = interrupted by this restart
